@@ -22,6 +22,7 @@ End-to-end recipe for benchmarking vLLM inference with speculative decoding (Eag
 | [preprocess_speedbench.py](https://github.com/MML-coder/ai-tools/blob/main/preprocess_speedbench.py) | MML-coder/ai-tools | Preprocess SPEED-Bench HF dataset into JSONL |
 | [analyze_speedbench_isl.py](https://github.com/MML-coder/ai-tools/blob/main/analyze_speedbench_isl.py) | MML-coder/ai-tools | Analyze input sequence length distribution |
 | [run_speedbench_gpt_oss_120b.py](https://github.com/MML-coder/ai-tools/blob/main/run_speedbench_gpt_oss_120b.py) | MML-coder/ai-tools | Automated multi-concurrency benchmark runner |
+| [import_manual_runs_json_v2.py](https://github.com/openshift-psap/performance-dashboard/blob/main/manual_runs/scripts/import_manual_runs_json_v2.py) | openshift-psap/performance-dashboard | Convert GuideLLM JSON to dashboard CSV |
 
 ## Models Benchmarked
 

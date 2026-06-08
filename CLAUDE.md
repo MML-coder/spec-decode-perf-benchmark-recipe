@@ -270,9 +270,21 @@ Checksums MUST match. If they don't, re-copy the file.
 
 ### Import Script
 
-Location: `performance-dashboard/manual_runs/scripts/import_manual_runs_json_v2.py`
+The conversion script lives in the [openshift-psap/performance-dashboard](https://github.com/openshift-psap/performance-dashboard) repo. Clone it first:
+
+```bash
+git clone https://github.com/openshift-psap/performance-dashboard.git
+cd performance-dashboard/manual_runs/scripts
+```
+
+Script: [`import_manual_runs_json_v2.py`](https://github.com/openshift-psap/performance-dashboard/blob/main/manual_runs/scripts/import_manual_runs_json_v2.py)
 
 Requires: `pandas` (use virtualenv with pandas installed)
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install pandas
+```
 
 ### Mode A: Multi-concurrency JSON (single file with all concurrency levels)
 
@@ -392,7 +404,7 @@ md5 -r ./speedbench-throughput-1k.json
 
 # 4. Convert to CSV
 source ~/test_foo/python3_virt/bin/activate
-cd /path/to/performance-dashboard/manual_runs/scripts
+cd performance-dashboard/manual_runs/scripts
 
 python import_manual_runs_json_v2.py \
   ./speedbench-throughput-1k.json \
@@ -444,7 +456,7 @@ md5 -r ./results_gemma-baseline/*.json
 
 # 4. Convert to CSV (appends per file)
 source ~/test_foo/python3_virt/bin/activate
-cd /path/to/performance-dashboard/manual_runs/scripts
+cd performance-dashboard/manual_runs/scripts
 
 for c in c1 c5 c25 c50 c100; do
   python import_manual_runs_json_v2.py \
@@ -489,4 +501,4 @@ done
 | `preprocess_speedbench.py` | [MML-coder/ai-tools](https://github.com/MML-coder/ai-tools/blob/main/preprocess_speedbench.py) | Preprocess SPEED-Bench HF dataset into JSONL |
 | `analyze_speedbench_isl.py` | [MML-coder/ai-tools](https://github.com/MML-coder/ai-tools/blob/main/analyze_speedbench_isl.py) | Analyze ISL distribution per split |
 | `run_speedbench_gpt_oss_120b.py` | [MML-coder/ai-tools](https://github.com/MML-coder/ai-tools/blob/main/run_speedbench_gpt_oss_120b.py) | Automated benchmark runner (local machine, remote pod) |
-| `import_manual_runs_json_v2.py` | `performance-dashboard/manual_runs/scripts/` | Convert GuideLLM JSON to dashboard-compatible CSV |
+| `import_manual_runs_json_v2.py` | [openshift-psap/performance-dashboard](https://github.com/openshift-psap/performance-dashboard/blob/main/manual_runs/scripts/import_manual_runs_json_v2.py) | Convert GuideLLM JSON to dashboard-compatible CSV |
