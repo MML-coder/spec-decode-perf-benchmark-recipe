@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: guidellm-<USER>
+  namespace: <NAMESPACE>
+  labels:
+    app: guidellm
+    user: <USER>
+spec:
+  restartPolicy: Always
+  securityContext:
+    fsGroup: 0
+    runAsUser: 0
+  containers:
+  - name: guidellm
+    image: python:3.11-slim
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      set -e
+      echo "Installing system dependencies..."
+      apt-get update
+      apt-get install -y tmux vim git curl wget procps
+
+      echo "Installing guidellm v0.6.0..."
+      pip install --upgrade pip
+      pip install 'guidellm[recommended] @ git+https://github.com/vllm-project/guidellm.git@v0.6.0'
+
+      echo "Installation complete!"
+      echo "guidellm version: $(guidellm --version || echo 'installed')"
+      echo ""
+      echo "Pod is ready. Use 'oc exec -it guidellm-<USER> -- bash' to access."
+      echo "Available tools: guidellm, tmux, vim"
+      echo "PVC mounted at /data (datasets + results)"
+      echo ""
+
+      # Keep container running
+      tail -f /dev/null
+    workingDir: /data
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "4"
+        memory: 8Gi
+    securityContext:
+      runAsUser: 0
+    volumeMounts:
+    - name: client-storage
+      mountPath: /data
+  volumes:
+  - name: client-storage
+    persistentVolumeClaim:
+      claimName: client-storage

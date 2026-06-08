@@ -13,32 +13,38 @@ Follow these steps in order. Each step links to the detailed section below.
 - Upload the processed JSONL files to a PVC on the cluster
 - See [Section 1: SPEED-Bench Datasets](#1-speed-bench-datasets)
 
-### Step 2: Deploy the Model
+### Step 2: Create the GuideLLM Client Pod
+- Create a PVC for datasets and results storage
+- Deploy a lightweight Python pod with GuideLLM installed
+- Upload preprocessed datasets to the PVC
+- See [Section 2: GuideLLM Client Pod Setup](#2-guidellm-client-pod-setup)
+
+### Step 3: Deploy the Model
 - Deploy vLLM as a KServe InferenceService on your cluster
 - Configure speculative decoding (or run baseline without it)
 - Note the endpoint URL for the next step
-- See [Section 2: vLLM Deployment](#2-vllm-deployment-kserve)
+- See [Section 3: vLLM Deployment](#3-vllm-deployment-kserve)
 
-### Step 3: Run the Benchmark
-- Execute GuideLLM from a pod that can reach the model endpoint
+### Step 4: Run the Benchmark
+- Execute GuideLLM from the client pod to hit the model endpoint
 - Choose multi-concurrency (one run) or per-concurrency (separate runs)
 - Wait for completion — output is a JSON file on the pod
-- See [Section 3: GuideLLM Benchmark Execution](#3-guidellm-benchmark-execution)
+- See [Section 4: GuideLLM Benchmark Execution](#4-guidellm-benchmark-execution)
 
-### Step 4: Copy Results Locally
+### Step 5: Copy Results Locally
 - Copy JSON result files from the pod to your local machine
 - **Always verify MD5 checksums** — large file copies can silently corrupt
-- See [Section 4: Copying Results from Pod](#4-copying-results-from-pod)
+- See [Section 5: Copying Results from Pod](#5-copying-results-from-pod)
 
-### Step 5: Convert JSON to CSV
+### Step 6: Convert JSON to CSV
 - Run the import script to extract metrics into a dashboard-compatible CSV
 - For per-concurrency JSONs, run once per file (script appends automatically)
-- See [Section 5: JSON to CSV Conversion](#5-json-to-csv-conversion)
+- See [Section 6: JSON to CSV Conversion](#6-json-to-csv-conversion)
 
-### Step 6: Review Results
+### Step 7: Review Results
 - Open the CSV to compare throughput, latency, and TTFT across concurrency levels
 - Compare baseline vs speculative decoding runs side by side
-- See [Section 6: Concrete Examples](#6-concrete-examples) for real command examples
+- See [Section 7: Concrete Examples](#7-concrete-examples) for real command examples
 
 ---
 
@@ -97,7 +103,111 @@ See [`datasets/speedbench.md`](datasets/speedbench.md) for detailed per-split br
 
 ---
 
-## 2. vLLM Deployment (KServe)
+## 2. GuideLLM Client Pod Setup
+
+GuideLLM runs from a lightweight client pod inside the cluster (so it can reach the vLLM endpoint via cluster-internal DNS). The pod needs a PVC for storing datasets and benchmark results.
+
+### 2.1 Create the Storage PVC
+
+The PVC stores preprocessed datasets and benchmark output JSON files. Create it once per namespace.
+
+Manifest: [`manifests/client-storage-pvc.yaml`](manifests/client-storage-pvc.yaml)
+
+```bash
+# Edit the namespace in the manifest, then apply
+oc apply -f manifests/client-storage-pvc.yaml
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: client-storage
+  namespace: <NAMESPACE>
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: nfs-provisioner
+```
+
+Adjust `storageClassName` for your cluster (e.g., `gp3-csi`, `ocs-storagecluster-cephfs`). 100Gi is sufficient for all SPEED-Bench splits plus benchmark results.
+
+### 2.2 Deploy the GuideLLM Pod
+
+The pod uses `python:3.11-slim` as a base and installs GuideLLM on startup. It stays running via `tail -f /dev/null` so you can `oc exec` into it.
+
+Manifest: [`manifests/guidellm-pod.yaml`](manifests/guidellm-pod.yaml)
+
+```bash
+# Replace <USER> and <NAMESPACE> in the manifest, then apply
+sed 's/<USER>/yourname/g; s/<NAMESPACE>/kserve-e2e-perf/g' manifests/guidellm-pod.yaml | oc apply -f -
+```
+
+What the pod does on startup:
+1. Installs system tools: `tmux`, `vim`, `git`, `curl`, `wget`, `procps`
+2. Installs GuideLLM v0.6.0 from the vllm-project GitHub repo
+3. Mounts the PVC at `/data`
+4. Stays running for interactive access
+
+Wait for the pod to be ready (GuideLLM installation takes ~2 minutes):
+
+```bash
+# Watch pod status
+oc get pod guidellm-<USER> -n <NAMESPACE> -w
+
+# Check logs to confirm installation completed
+oc logs guidellm-<USER> -n <NAMESPACE>
+
+# Should see: "Installation complete!" and "Pod is ready."
+```
+
+### 2.3 Upload Datasets to the PVC
+
+Once the pod is running, copy preprocessed SPEED-Bench datasets to it:
+
+```bash
+# Copy from local machine to pod PVC
+oc cp /tmp/speed-bench-processed <NAMESPACE>/guidellm-<USER>:/data/datasets/speed-bench-processed
+
+# Verify on pod
+oc exec -n <NAMESPACE> guidellm-<USER> -- ls /data/datasets/speed-bench-processed/
+# Expected: qualitative  throughput_1k  throughput_2k  throughput_8k  throughput_16k  throughput_32k
+```
+
+### 2.4 Create Results Directories
+
+Create a directory on the PVC for benchmark output before running:
+
+```bash
+oc exec -n <NAMESPACE> guidellm-<USER> -- mkdir -p /data/results
+```
+
+### 2.5 Verify Setup
+
+```bash
+# Confirm guidellm is installed
+oc exec -n <NAMESPACE> guidellm-<USER> -- guidellm --version
+
+# Confirm datasets are available
+oc exec -n <NAMESPACE> guidellm-<USER> -- wc -l /data/datasets/speed-bench-processed/throughput_1k/all.jsonl
+# Expected: 897
+
+# Interactive access (for running benchmarks manually)
+oc exec -it -n <NAMESPACE> guidellm-<USER> -- bash
+```
+
+### Resource Notes
+
+- **CPU/Memory**: 4 CPU / 8Gi memory limits. GuideLLM is CPU-bound (no GPU needed) — it sends HTTP requests to the vLLM endpoint. The original pod with 4Gi was OOMKilled under high concurrency, so 8Gi is recommended.
+- **PVC**: `ReadWriteOnce` is fine — only this pod mounts it. If you need multiple pods sharing results, use `ReadWriteMany` with an NFS-backed storageClass.
+- **SecurityContext**: `runAsUser: 0` is needed for `apt-get install`. If your cluster doesn't allow root, pre-build a custom image with the dependencies baked in.
+
+---
+
+## 3. vLLM Deployment (KServe)
 
 ### KServe Pattern
 
@@ -163,7 +273,7 @@ http://<deployment-name>-predictor.<namespace>.svc.cluster.local:8080/v1
 
 ---
 
-## 3. GuideLLM Benchmark Execution
+## 4. GuideLLM Benchmark Execution
 
 ### Two Run Modes
 
@@ -199,7 +309,7 @@ done
 ### Execution from GuideLLM Pod
 
 ```bash
-oc exec -n <namespace> <guidellm-pod> -- \
+oc exec -n <namespace> guidellm-<USER> -- \
   guidellm benchmark \
     --target <endpoint-url> \
     --data <dataset-path> \
@@ -225,7 +335,7 @@ For scripted multi-concurrency runs: [`run_speedbench_gpt_oss_120b.py`](https://
 
 ---
 
-## 4. Copying Results from Pod
+## 5. Copying Results from Pod
 
 ### Standard Copy (small-medium files, < ~100MB)
 
@@ -238,7 +348,7 @@ oc cp <namespace>/<pod>:/data/results/output.json ./output.json --retries=5
 `oc cp` may fail with EOF on large files. Use `--retries=5` which handles resume:
 
 ```bash
-oc cp kserve-e2e-perf/guidellm-pod:/data/results/large-file.json ./large-file.json --retries=5
+oc cp kserve-e2e-perf/guidellm-<USER>:/data/results/large-file.json ./large-file.json --retries=5
 ```
 
 If `oc cp` still fails, fall back to `oc exec cat` (but always verify checksum — `cat` over `oc exec` can corrupt binary-ish content):
@@ -266,7 +376,7 @@ Checksums MUST match. If they don't, re-copy the file.
 
 ---
 
-## 5. JSON to CSV Conversion
+## 6. JSON to CSV Conversion
 
 ### Import Script
 
@@ -378,7 +488,7 @@ Full column list: `run, accelerator, model, version, prompt toks, output toks, T
 
 ---
 
-## 6. Concrete Examples
+## 7. Concrete Examples
 
 ### Example A: gpt-oss-120b with RedHat Eagle3 Draft (RHAIIS)
 
@@ -386,7 +496,7 @@ Model: `openai/gpt-oss-120b` with `RedHatAI/gpt-oss-120b-speculator.eagle3`
 
 ```bash
 # 1. Run GuideLLM (multi-concurrency mode, from pod)
-oc exec -n kserve-e2e-perf guidellm-pod -- \
+oc exec -n kserve-e2e-perf guidellm-<USER> -- \
   guidellm benchmark \
     --target http://gpt-oss-120b-predictor.kserve-e2e-perf.svc.cluster.local:8080/v1 \
     --data /data/datasets/speed-bench-processed/throughput_1k/all.jsonl \
@@ -395,11 +505,11 @@ oc exec -n kserve-e2e-perf guidellm-pod -- \
     --output-path /data/results-rh-spec/speedbench-throughput-1k.json
 
 # 2. Copy results
-oc cp kserve-e2e-perf/guidellm-pod:/data/results-rh-spec/speedbench-throughput-1k.json \
+oc cp kserve-e2e-perf/guidellm-<USER>:/data/results-rh-spec/speedbench-throughput-1k.json \
   ./speedbench-throughput-1k.json --retries=5
 
 # 3. Verify MD5
-oc exec -n kserve-e2e-perf guidellm-pod -- md5sum /data/results-rh-spec/speedbench-throughput-1k.json
+oc exec -n kserve-e2e-perf guidellm-<USER> -- md5sum /data/results-rh-spec/speedbench-throughput-1k.json
 md5 -r ./speedbench-throughput-1k.json
 
 # 4. Convert to CSV
@@ -430,7 +540,7 @@ Per-concurrency mode (5 separate JSONs: c1.json, c5.json, c25.json, c50.json, c1
 ```bash
 # 1. Run GuideLLM (per-concurrency, from pod)
 for c in 1 5 25 50 100; do
-  oc exec -n kserve-e2e-perf guidellm-pod -- \
+  oc exec -n kserve-e2e-perf guidellm-<USER> -- \
     guidellm benchmark \
       --target http://gemma-4-31b-it-predictor.kserve-e2e-perf.svc.cluster.local:8080/v1 \
       --data /data/datasets/speed-bench-processed/throughput_1k/all.jsonl \
@@ -442,12 +552,12 @@ done
 
 # 2. Copy all files
 for c in c1 c5 c25 c50 c100; do
-  oc cp kserve-e2e-perf/guidellm-pod:/data/results_gemma-baseline/${c}.json \
+  oc cp kserve-e2e-perf/guidellm-<USER>:/data/results_gemma-baseline/${c}.json \
     ./results_gemma-baseline/${c}.json --retries=5
 done
 
 # 3. Verify MD5 for all
-oc exec -n kserve-e2e-perf guidellm-pod -- \
+oc exec -n kserve-e2e-perf guidellm-<USER> -- \
   md5sum /data/results_gemma-baseline/c1.json /data/results_gemma-baseline/c5.json \
          /data/results_gemma-baseline/c25.json /data/results_gemma-baseline/c50.json \
          /data/results_gemma-baseline/c100.json
@@ -494,7 +604,7 @@ done
 
 ---
 
-## 7. Tool References
+## 8. Tool References
 
 | Tool | Location | Purpose |
 |------|----------|---------|
