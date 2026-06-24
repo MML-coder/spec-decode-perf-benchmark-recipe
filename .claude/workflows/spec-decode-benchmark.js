@@ -371,8 +371,12 @@ log('Model deployed: ' + deploy.message)
 // Phase 4: Run Benchmarks
 phase('Benchmark')
 const splits = cfg.benchmark.splits || ['throughput_1k']
-const concurrencyList = (cfg.benchmark.concurrency || [1, 5, 25, 50, 100]).join(',')
-const benchmarkMode = cfg.benchmark.mode || 'multi-concurrency'
+const concurrencyLevels = cfg.benchmark.concurrency || [1, 5, 25, 50, 100]
+const concurrencyList = concurrencyLevels.join(',')
+const benchmarkMode = cfg.benchmark.mode || 'per-concurrency'
+const maxReqMultiplier = cfg.benchmark.max_requests_multiplier || 3
+const maxReqMinimum = cfg.benchmark.max_requests_minimum || 100
+const backendTimeout = cfg.benchmark.backend_timeout || 100000
 
 log(`Running benchmarks: ${splits.length} split(s), concurrency=[${concurrencyList}], mode=${benchmarkMode}`)
 
@@ -387,10 +391,16 @@ for (const split of splits) {
     dataPath = `/data/datasets/speed-bench-processed/${split}/all.jsonl`
   }
 
-  const outputPath = `/data/results/speedbench-${split}.json`
+  const resultsSubdir = `/data/results_${split}_${cfg.spec_decoding.label}`
   const dataFlag = cfg.benchmark.dataset === 'synthetic'
     ? `--data "${dataPath}"`
     : `--data ${dataPath}`
+
+  // Build per-concurrency max_requests table for the agent prompt
+  const perConcurrencyTable = concurrencyLevels.map(c => {
+    const maxReq = Math.max(maxReqMinimum, maxReqMultiplier * c)
+    return `  concurrency=${c} -> max_requests=${maxReq}`
+  }).join('\n')
 
   const bench = await agent(`
 You are running a GuideLLM benchmark on a Kubernetes cluster.
@@ -402,9 +412,10 @@ Pod: ${podName}
 Target endpoint: ${endpointUrl}
 Dataset: ${cfg.benchmark.dataset}
 Data path/config: ${dataPath}
-Output path on pod: ${outputPath}
+Results directory on pod: ${resultsSubdir}
 Concurrency levels: ${concurrencyList}
 Mode: ${benchmarkMode}
+Backend timeout: ${backendTimeout}
 
 Steps:
 
@@ -413,25 +424,52 @@ Steps:
    If it does NOT exist, report failure immediately — the user needs to upload datasets first.
 
 2. Create results directory on pod:
-   ${kc} oc exec -n ${ns} ${podName} -- mkdir -p /data/results
+   ${kc} oc exec -n ${ns} ${podName} -- mkdir -p ${resultsSubdir}
 
-3. Run the GuideLLM benchmark. Use mode "${benchmarkMode}":
+3. Run the GuideLLM benchmark using mode "${benchmarkMode}":
 
-   For multi-concurrency mode (produces 1 JSON with all concurrency levels):
-   ${kc} oc exec -n ${ns} ${podName} -- guidellm benchmark \\
-     --target ${endpointUrl} \\
-     ${dataFlag} \\
-     --rate-type concurrent \\
-     --rate ${concurrencyList} \\
-     --output-path ${outputPath}
+   === MODE: multi-concurrency ===
+   (Use this if mode is "multi-concurrency")
+   Produces 1 JSON file with all concurrency levels inside:
 
-   IMPORTANT: This command may take 30-120 minutes. Run it and wait for completion.
-   Do NOT set a short timeout — use at least 7200 seconds (2 hours).
+   ${kc} oc exec -n ${ns} ${podName} -- \\
+     guidellm benchmark run \\
+       --target ${endpointUrl} \\
+       --backend-kwargs '{"timeout":${backendTimeout}}' \\
+       ${dataFlag} \\
+       --rate-type concurrent \\
+       --rate ${concurrencyList} \\
+       --output-path ${resultsSubdir}/speedbench-${split}.json
 
-4. After completion, verify the output file exists:
-   ${kc} oc exec -n ${ns} ${podName} -- ls -la ${outputPath}
+   === MODE: per-concurrency ===
+   (Use this if mode is "per-concurrency")
+   Produces 1 JSON per concurrency level. max_requests = max(${maxReqMinimum}, ${maxReqMultiplier} * concurrency):
 
-Report success=true with the output path, or success=false with error details.
+${perConcurrencyTable}
+
+   Run each concurrency level sequentially:
+   for c in ${concurrencyList.replace(/,/g, ' ')}; do
+     maxreq=$(( ${maxReqMultiplier} * c ))
+     if [ $maxreq -lt ${maxReqMinimum} ]; then maxreq=${maxReqMinimum}; fi
+
+     ${kc} oc exec -n ${ns} ${podName} -- \\
+       guidellm benchmark run \\
+         --target ${endpointUrl} \\
+         --backend-kwargs '{"timeout":${backendTimeout}}' \\
+         ${dataFlag} \\
+         --rate-type concurrent \\
+         --rate $c \\
+         --max-requests $maxreq \\
+         --output-path ${resultsSubdir}/c$c.json
+   done
+
+   IMPORTANT: Each concurrency run can take 10-60 minutes. Run them sequentially and wait for each to complete.
+   Do NOT set a short timeout — use at least 7200 seconds (2 hours) per command.
+
+4. After completion, verify output files exist:
+   ${kc} oc exec -n ${ns} ${podName} -- ls -la ${resultsSubdir}/
+
+Report success=true with the results directory path, or success=false with error details.
 Split name: ${split}
 `, { label: 'benchmark-' + split, schema: STATUS_SCHEMA })
 
@@ -454,6 +492,9 @@ if (failedBench.length === benchResults.length) {
 phase('Collect')
 log('Copying results from pod and verifying MD5 checksums...')
 
+// Build per-concurrency file list for collect agent
+const concurrencyFileList = concurrencyLevels.map(c => `c${c}.json`).join(', ')
+
 const collect = await agent(`
 You are collecting benchmark results from a Kubernetes pod to the local machine.
 MD5 verification is MANDATORY — do not skip it.
@@ -463,25 +504,42 @@ Namespace: ${ns}
 Pod: ${podName}
 Local results directory: ${cfg.output.results_dir}
 Splits that were benchmarked: ${splits.join(', ')}
+Benchmark mode: ${benchmarkMode}
+Spec decoding label: ${cfg.spec_decoding.label}
+Concurrency levels: ${concurrencyList}
+
+The remote results are organized by split and spec label:
+  /data/results_<split>_<spec_label>/
 
 Steps:
 
-1. Create the local results directory: mkdir -p ${cfg.output.results_dir}
+1. Create local results directories:
+   For each split, create: mkdir -p ${cfg.output.results_dir}/<split>_${cfg.spec_decoding.label}
 
 2. For each split (${splits.join(', ')}):
-   a. Get the remote MD5 checksum:
-      ${kc} oc exec -n ${ns} ${podName} -- md5sum /data/results/speedbench-<split>.json
+   Remote dir: /data/results_<split>_${cfg.spec_decoding.label}/
 
-   b. Copy the file:
-      ${kc} oc cp ${ns}/${podName}:/data/results/speedbench-<split>.json ${cfg.output.results_dir}/speedbench-<split>.json --retries=5
+   If mode is "multi-concurrency":
+     - Single file: speedbench-<split>.json
+     - Copy it, verify MD5
 
-   c. Get the local MD5 checksum:
-      md5 -r ${cfg.output.results_dir}/speedbench-<split>.json  (macOS)
-      OR: md5sum ${cfg.output.results_dir}/speedbench-<split>.json  (Linux)
+   If mode is "per-concurrency":
+     - Multiple files: ${concurrencyFileList}
+     - Copy each file, verify MD5 for each
 
-   d. Compare checksums. If they do NOT match:
-      - Delete the local file
-      - Retry the copy up to 3 times
+   For EACH file:
+   a. Get remote MD5:
+      ${kc} oc exec -n ${ns} ${podName} -- md5sum <remote_path>
+
+   b. Copy:
+      ${kc} oc cp ${ns}/${podName}:<remote_path> <local_path> --retries=5
+
+   c. Get local MD5:
+      md5 -r <local_path>  (macOS) OR md5sum <local_path> (Linux)
+
+   d. If checksums do NOT match:
+      - Delete local file
+      - Retry copy up to 3 times
       - If still mismatched after 3 retries, report failure for that file
 
 3. List all collected files with their sizes.
@@ -517,8 +575,10 @@ Configuration:
   Prefix caching: ${cfg.benchmark.prefix_caching}
   Runtime args: ${runtimeArgsStr}
 
-Results directory: ${cfg.output.results_dir}
+Local results directory: ${cfg.output.results_dir}
 Splits: ${splits.join(', ')}
+Benchmark mode: ${benchmarkMode}
+Concurrency levels: ${concurrencyList}
 
 Steps:
 
@@ -531,30 +591,51 @@ For each split (${splits.join(', ')}):
      - throughput_32k -> SPEEDBENCH-32k
      - If synthetic, use "synthetic"
 
-  2. Determine the CSV filename:
-     ${cfg.output.results_dir}/speedbench-<split>_${cfg.spec_decoding.label}.csv
+  2. Determine the CSV filename (one CSV per split):
+     ${cfg.output.results_dir}/<split>_${cfg.spec_decoding.label}/<split>_${cfg.spec_decoding.label}.csv
 
   3. Run the import script:
-     source ~/test_foo/python3_virt/bin/activate
-     cd /Users/memehta/workspace/performance-dashboard/manual_runs/scripts
-     python import_manual_runs_json_v2.py \\
-       ${cfg.output.results_dir}/speedbench-<split>.json \\
-       --model "${cfg.model.hf_id}" \\
-       --version "${cfg.model.version}" \\
-       --tp ${cfg.model.tp} \\
-       --accelerator "${cfg.cluster.accelerator}" \\
-       --runtime-args '${runtimeArgsStr}' \\
-       --image-tag "${cfg.model.image}" \\
-       --guidellm-version "${cfg.benchmark.guidellm_version}" \\
-       --dataset "<DATASET_LABEL>" \\
-       --spec-decoding "${cfg.spec_decoding.label}" \\
-       --prefix-caching "${cfg.benchmark.prefix_caching}" \\
-       --csv-file "<CSV_PATH>"
+
+     If mode is "multi-concurrency":
+       Single JSON file contains all concurrency levels. Run once:
+       source ~/test_foo/python3_virt/bin/activate
+       cd /Users/memehta/workspace/performance-dashboard/manual_runs/scripts
+       python import_manual_runs_json_v2.py \\
+         ${cfg.output.results_dir}/<split>_${cfg.spec_decoding.label}/speedbench-<split>.json \\
+         --model "${cfg.model.hf_id}" \\
+         --version "${cfg.model.version}" \\
+         --tp ${cfg.model.tp} \\
+         --accelerator "${cfg.cluster.accelerator}" \\
+         --runtime-args '${runtimeArgsStr}' \\
+         --image-tag "${cfg.model.image}" \\
+         --guidellm-version "${cfg.benchmark.guidellm_version}" \\
+         --dataset "<DATASET_LABEL>" \\
+         --spec-decoding "${cfg.spec_decoding.label}" \\
+         --prefix-caching "${cfg.benchmark.prefix_caching}" \\
+         --csv-file "<CSV_PATH>"
+
+     If mode is "per-concurrency":
+       Multiple JSON files (c1.json, c5.json, etc). Run once per file — the script APPENDS to the same CSV:
+       source ~/test_foo/python3_virt/bin/activate
+       cd /Users/memehta/workspace/performance-dashboard/manual_runs/scripts
+       for c in ${concurrencyList.replace(/,/g, ' ')}; do
+         python import_manual_runs_json_v2.py \\
+           ${cfg.output.results_dir}/<split>_${cfg.spec_decoding.label}/c$c.json \\
+           --model "${cfg.model.hf_id}" \\
+           --version "${cfg.model.version}" \\
+           --tp ${cfg.model.tp} \\
+           --accelerator "${cfg.cluster.accelerator}" \\
+           --runtime-args '${runtimeArgsStr}' \\
+           --image-tag "${cfg.model.image}" \\
+           --guidellm-version "${cfg.benchmark.guidellm_version}" \\
+           --dataset "<DATASET_LABEL>" \\
+           --spec-decoding "${cfg.spec_decoding.label}" \\
+           --prefix-caching "${cfg.benchmark.prefix_caching}" \\
+           --csv-file "<CSV_PATH>"
+       done
 
   4. Verify the CSV was created and has the expected number of rows.
-     Expected rows = number of concurrency levels (${(cfg.benchmark.concurrency || []).length}).
-
-  5. Copy the CSV to the results directory if it was created elsewhere.
+     Expected rows = number of concurrency levels (${concurrencyLevels.length}).
 
 Report the list of CSV files created and their row counts.
 `, { label: 'convert-csv', schema: SUMMARY_SCHEMA })

@@ -7,7 +7,7 @@ cluster:
   namespace: kserve-e2e-perf           # namespace for benchmark pods
   accelerator: H200                    # H200, B200, MI300X
   storage_class: lvms-vg1              # cluster storage class (run: oc get sc)
-  user: ""                             # your username (for pod naming)
+  user: "mehulm"                             # your username (for pod naming)
 
 model:
   hf_id: ""                           # HuggingFace model ID (e.g., openai/gpt-oss-120b)
@@ -41,7 +41,10 @@ benchmark:
     - 25
     - 50
     - 100
-  mode: multi-concurrency             # multi-concurrency (1 JSON) or per-concurrency (N JSONs)
+  mode: per-concurrency                # multi-concurrency (1 JSON) or per-concurrency (N JSONs)
+  max_requests_multiplier: 3           # per-concurrency mode: max_requests = max(min, multiplier * concurrency)
+  max_requests_minimum: 100            # per-concurrency mode: minimum max_requests
+  backend_timeout: 100000              # --backend-kwargs timeout in ms
   guidellm_version: v0.6.0
   prefix_caching: "yes"
 

@@ -35,7 +35,10 @@ benchmark:
     - throughput_1k
     - throughput_8k
   concurrency: [1, 5, 25, 50, 100]
-  mode: multi-concurrency
+  mode: per-concurrency
+  max_requests_multiplier: 3
+  max_requests_minimum: 100
+  backend_timeout: 100000
   guidellm_version: v0.6.0
   prefix_caching: "yes"
 
