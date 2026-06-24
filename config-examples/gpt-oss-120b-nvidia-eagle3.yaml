@@ -30,8 +30,8 @@ model:
 
 spec_decoding:
   enabled: true
-  draft_model: nvidia/gpt-oss-120b-Eagle3-v2
-  num_speculative_tokens: 3
+  draft_model: nvidia/gpt-oss-120b-Eagle3-v3
+  num_speculative_tokens: 7
   method: eagle3
   draft_tensor_parallel_size: 1
   label: eagle3-nvidia

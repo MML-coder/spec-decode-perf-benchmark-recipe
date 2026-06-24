@@ -31,7 +31,7 @@ model:
 spec_decoding:
   enabled: true
   draft_model: RedHatAI/gpt-oss-120b-speculator.eagle3
-  num_speculative_tokens: 3
+  num_speculative_tokens: 5
   method: eagle3
   draft_tensor_parallel_size: 1
   label: eagle3-redhat
