@@ -1,58 +1,55 @@
 # Speculative Decoding Benchmark Configuration
-# Copy this file, fill in your cluster details, and run:
-#   KUBECONFIG=/path/to/kubeconfig claude /workflows spec-decode-benchmark
+# Run: claude /workflows spec-decode-benchmark
 
 cluster:
-  kubeconfig: ""                       # path to kubeconfig file
-  namespace: kserve-e2e-perf           # namespace for benchmark pods
-  accelerator: H200                    # H200, B200, MI300X
-  storage_class: lvms-vg1              # cluster storage class (run: oc get sc)
-  user: "mehulm"                             # your username (for pod naming)
+  kubeconfig: /Users/memehta/kubeconfigs/kubeconfig_rhaiis_ibm_dc
+  namespace: kserve-e2e-perf
+  accelerator: H200
+  storage_class: nfs-provisioner
+  user: mehulm
 
 model:
-  hf_id: ""                           # HuggingFace model ID (e.g., openai/gpt-oss-120b)
-  image: ""                           # vLLM container image
-  version: ""                         # version label for CSV (e.g., RHAIIS-3.5.EA1, vLLM-0.22.0)
-  tp: 1                               # tensor parallelism size
-  gpu_count: 1                        # number of GPUs (usually = tp)
-  storage_pvc: model-pvc              # PVC containing model weights
-  node_selector: ""                   # kubernetes.io/hostname value (run: oc get nodes)
-  service_account: sa                 # service account for model pod
-  image_pull_secret: ""               # image pull secret name (if needed for private registry)
-  hf_token_secret: storage-config     # K8s secret name containing HF_TOKEN key
-  shared_memory_size: 8Gi             # /dev/shm size (use 64Gi for large TP)
-  model_loading_timeout: 300000       # builtInAdapter timeout in ms
+  hf_id: openai/gpt-oss-120b
+  image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.2-1782155603
+  version: RHAIIS-3.5.EA2
+  tp: 1
+  gpu_count: 1
+  storage_pvc: model-pvc-2
+  node_selector: psap-llmd-h200-gpu-qdndv
+  service_account: sa
+  image_pull_secret: npalaska-image-pull
+  hf_token_secret: storage-config
+  shared_memory_size: 8Gi
+  model_loading_timeout: 300000
   vllm_args:
     gpu-memory-utilization: "0.85"
     trust-remote-code: "true"
     disable-log-requests: "true"
     uvicorn-log-level: debug
     no-enable-prefix-caching: "true"
+    enable-expert-parallel: "true"
 
 spec_decoding:
-  enabled: false                       # set true to enable speculative decoding
-  draft_model: ""                      # draft model HF ID
-  num_speculative_tokens: 3
-  method: eagle3
-  draft_tensor_parallel_size: 1
-  label: baseline                      # label for CSV spec_decoding column
+  enabled: false
+  label: baseline
 
 benchmark:
-  dataset: speedbench                  # speedbench or synthetic
-  splits:                              # which SPEEDBENCH splits to run
+  dataset: speedbench
+  splits:
     - throughput_1k
-  concurrency:                         # concurrency levels to sweep
+    - throughput_8k
+  concurrency:
     - 1
     - 5
     - 25
     - 50
     - 100
-  mode: per-concurrency                # multi-concurrency (1 JSON) or per-concurrency (N JSONs)
-  max_requests_multiplier: 3           # per-concurrency mode: max_requests = max(min, multiplier * concurrency)
-  max_requests_minimum: 100            # per-concurrency mode: minimum max_requests
-  backend_timeout: 100000              # --backend-kwargs timeout in ms
+  mode: per-concurrency
+  max_requests_multiplier: 3
+  max_requests_minimum: 100
+  backend_timeout: 100000
   guidellm_version: v0.6.0
   prefix_caching: "yes"
 
 output:
-  results_dir: ./results               # local directory for JSON + CSV output
+  results_dir: ./results

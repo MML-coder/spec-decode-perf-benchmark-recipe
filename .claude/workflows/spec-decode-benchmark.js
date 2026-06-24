@@ -78,6 +78,7 @@ const VALIDATE_SCHEMA = {
     deployment_name: { type: 'string' },
     endpoint_url: { type: 'string' },
     pod_name: { type: 'string' },
+    run_date: { type: 'string' },
     errors: { type: 'array', items: { type: 'string' } },
   },
 }
@@ -163,7 +164,10 @@ You are validating the benchmark configuration. Do these steps exactly:
 
 9. Derive the pod name: guidellm-<cluster.user>
 
-Return the full parsed config, cluster_user from oc whoami, deployment_name, endpoint_url, pod_name, and any errors.
+10. Get today's date by running: date +%Y%m%d
+    Return this as the "run_date" field (e.g., "20260624").
+
+Return the full parsed config, cluster_user from oc whoami, deployment_name, endpoint_url, pod_name, run_date, and any errors.
 `, { label: 'validate-config', schema: VALIDATE_SCHEMA })
 
 if (!validation || !validation.valid) {
@@ -179,9 +183,11 @@ const podName = validation.pod_name
 const kc = `KUBECONFIG=${cfg.cluster.kubeconfig}`
 const ns = cfg.cluster.namespace
 
+const runDate = validation.run_date || '00000000'
+
 log(`Validated: model=${cfg.model.hf_id}, deployment=${deploymentName}, pod=${podName}`)
 log(`Endpoint: ${endpointUrl}`)
-log(`Cluster user: ${validation.cluster_user}`)
+log(`Cluster user: ${validation.cluster_user}, date: ${runDate}`)
 
 // Phase 2: Setup Infrastructure
 phase('Setup')
@@ -403,7 +409,7 @@ for (const split of splits) {
     dataPath = `/data/datasets/speed-bench-processed/${split}/all.jsonl`
   }
 
-  const resultsSubdir = `/data/results_${split}_${cfg.spec_decoding.label}`
+  const resultsSubdir = `/data/results_${deploymentName}_${cfg.spec_decoding.label}_${runDate}`
   const dataFlag = cfg.benchmark.dataset === 'synthetic'
     ? `--data "${dataPath}"`
     : `--data ${dataPath}`
@@ -451,7 +457,7 @@ Steps:
        ${dataFlag} \\
        --rate-type concurrent \\
        --rate ${concurrencyList} \\
-       --output-path ${resultsSubdir}/speedbench-${split}.json
+       --output-path ${resultsSubdir}/speedbench-${split.replace('throughput_', '')}.json
 
    === MODE: per-concurrency ===
    (Use this if mode is "per-concurrency")
@@ -472,7 +478,7 @@ ${perConcurrencyTable}
          --rate-type concurrent \\
          --rate $c \\
          --max-requests $maxreq \\
-         --output-path ${resultsSubdir}/c$c.json
+         --output-path ${resultsSubdir}/${split.replace('throughput_', '')}_c$c.json
    done
 
    IMPORTANT: Each concurrency run can take 10-60 minutes. Run them sequentially and wait for each to complete.
@@ -505,7 +511,8 @@ phase('Collect')
 log('Copying results from pod and verifying MD5 checksums...')
 
 // Build per-concurrency file list for collect agent
-const concurrencyFileList = concurrencyLevels.map(c => `c${c}.json`).join(', ')
+const concurrencyFileList = concurrencyLevels.map(c => `<split_short>_c${c}.json`).join(', ')
+const remoteResultsDir = `/data/results_${deploymentName}_${cfg.spec_decoding.label}_${runDate}`
 
 const collect = await agent(`
 You are collecting benchmark results from a Kubernetes pod to the local machine.
@@ -520,23 +527,28 @@ Benchmark mode: ${benchmarkMode}
 Spec decoding label: ${cfg.spec_decoding.label}
 Concurrency levels: ${concurrencyList}
 
-The remote results are organized by split and spec label:
-  /data/results_<split>_<spec_label>/
+The remote results directory is:
+  /data/results_${deploymentName}_${cfg.spec_decoding.label}_${runDate}/
+
+All splits share this single remote directory. Files are prefixed with the split name (e.g., 1k_c1.json, 8k_c5.json for per-concurrency, or speedbench-throughput_1k.json for multi-concurrency).
 
 Steps:
 
-1. Create local results directories:
-   For each split, create: mkdir -p ${cfg.output.results_dir}/<split>_${cfg.spec_decoding.label}
+1. Create local results directory:
+   mkdir -p ${cfg.output.results_dir}/results_${deploymentName}_${cfg.spec_decoding.label}_${runDate}
 
 2. For each split (${splits.join(', ')}):
-   Remote dir: /data/results_<split>_${cfg.spec_decoding.label}/
+   Remote dir: /data/results_${deploymentName}_${cfg.spec_decoding.label}_${runDate}/
+
+   The split short name is derived by removing "throughput_" prefix (e.g., throughput_1k -> 1k, throughput_8k -> 8k).
 
    If mode is "multi-concurrency":
-     - Single file: speedbench-<split>.json
+     - Single file: speedbench-<split_short>.json
      - Copy it, verify MD5
 
    If mode is "per-concurrency":
-     - Multiple files: ${concurrencyFileList}
+     - Multiple files per split: <split_short>_c1.json, <split_short>_c5.json, <split_short>_c25.json, etc.
+     - For concurrency levels: ${concurrencyList}
      - Copy each file, verify MD5 for each
 
    For EACH file:
