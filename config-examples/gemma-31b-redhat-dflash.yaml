@@ -1,0 +1,52 @@
+# gemma-4-31B-it with RedHat dflash draft model on upstream vLLM
+cluster:
+  kubeconfig: /Users/memehta/kubeconfigs/kubeconfig-rhaiis-h200
+  namespace: kserve-e2e-perf
+  accelerator: H200
+  storage_class: lvms-vg1
+  user: mehulm
+
+model:
+  hf_id: google/gemma-4-31B-it
+  image: vllm/vllm-openai:v0.22.0
+  version: vLLM-0.22.0
+  tp: 1
+  gpu_count: 1
+  storage_pvc: model-pvc-2
+  node_selector: ""
+  service_account: sa
+  image_pull_secret: npalaska-image-pull
+  hf_token_secret: storage-config
+  shared_memory_size: 8Gi
+  model_loading_timeout: 300000
+  vllm_args:
+    gpu-memory-utilization: "0.92"
+    trust-remote-code: "true"
+    disable-log-requests: "true"
+    uvicorn-log-level: debug
+    no-enable-prefix-caching: "true"
+    no-async-scheduling: "true"
+
+spec_decoding:
+  enabled: true
+  draft_model: RedHatAI/gemma-4-31B-it-speculator.dflash
+  num_speculative_tokens: 7
+  method: dflash
+  draft_tensor_parallel_size: 1
+  label: dflash-redhat
+
+benchmark:
+  dataset: speedbench
+  splits:
+    - throughput_1k
+    - throughput_8k
+  concurrency: [1, 5, 25, 50, 100]
+  mode: per-concurrency
+  max_requests_multiplier: 3
+  max_requests_minimum: 100
+  backend_timeout: 100000
+  guidellm_version: v0.6.0
+  prefix_caching: "yes"
+
+output:
+  results_dir: ./results
