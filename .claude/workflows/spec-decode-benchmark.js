@@ -1,0 +1,621 @@
+export const meta = {
+  name: 'spec-decode-benchmark',
+  description: 'End-to-end speculative decoding benchmark: deploy model, run GuideLLM, collect results, generate CSV',
+  whenToUse: 'When the user wants to run a speculative decoding benchmark end-to-end on a Kubernetes cluster',
+  phases: [
+    { title: 'Validate', detail: 'Read config.yaml, verify cluster access' },
+    { title: 'Setup', detail: 'Create PVC + GuideLLM pod if needed' },
+    { title: 'Deploy', detail: 'Deploy vLLM model via KServe' },
+    { title: 'Benchmark', detail: 'Run GuideLLM benchmarks for each dataset split' },
+    { title: 'Collect', detail: 'Copy results from pod, verify MD5 checksums' },
+    { title: 'Convert', detail: 'Convert JSON results to CSV' },
+    { title: 'Summary', detail: 'Print performance summary with geomean comparison' },
+  ],
+}
+
+const CONFIG_SCHEMA = {
+  type: 'object',
+  properties: {
+    cluster: {
+      type: 'object',
+      properties: {
+        kubeconfig: { type: 'string' },
+        namespace: { type: 'string' },
+        accelerator: { type: 'string' },
+        storage_class: { type: 'string' },
+        user: { type: 'string' },
+      },
+    },
+    model: {
+      type: 'object',
+      properties: {
+        hf_id: { type: 'string' },
+        image: { type: 'string' },
+        version: { type: 'string' },
+        tp: { type: 'number' },
+        gpu_count: { type: 'number' },
+        storage_pvc: { type: 'string' },
+        vllm_args: { type: 'object' },
+      },
+    },
+    spec_decoding: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean' },
+        draft_model: { type: 'string' },
+        num_speculative_tokens: { type: 'number' },
+        method: { type: 'string' },
+        draft_tensor_parallel_size: { type: 'number' },
+        label: { type: 'string' },
+      },
+    },
+    benchmark: {
+      type: 'object',
+      properties: {
+        dataset: { type: 'string' },
+        splits: { type: 'array', items: { type: 'string' } },
+        concurrency: { type: 'array', items: { type: 'number' } },
+        mode: { type: 'string' },
+        guidellm_version: { type: 'string' },
+        prefix_caching: { type: 'string' },
+      },
+    },
+    output: {
+      type: 'object',
+      properties: {
+        results_dir: { type: 'string' },
+      },
+    },
+  },
+}
+
+const VALIDATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    valid: { type: 'boolean' },
+    config: CONFIG_SCHEMA,
+    cluster_user: { type: 'string' },
+    deployment_name: { type: 'string' },
+    endpoint_url: { type: 'string' },
+    pod_name: { type: 'string' },
+    errors: { type: 'array', items: { type: 'string' } },
+  },
+}
+
+const STATUS_SCHEMA = {
+  type: 'object',
+  properties: {
+    success: { type: 'boolean' },
+    message: { type: 'string' },
+    details: { type: 'string' },
+  },
+}
+
+const COLLECT_SCHEMA = {
+  type: 'object',
+  properties: {
+    success: { type: 'boolean' },
+    files: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, local_path: { type: 'string' }, md5_match: { type: 'boolean' } } } },
+    message: { type: 'string' },
+  },
+}
+
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    csv_files: { type: 'array', items: { type: 'string' } },
+  },
+}
+
+// Phase 1: Validate
+phase('Validate')
+log('Reading config.yaml and validating cluster access...')
+
+const validation = await agent(`
+You are validating the benchmark configuration. Do these steps exactly:
+
+1. Read the file config.yaml in the current working directory. Parse it as YAML.
+
+2. Check that ALL required fields are non-empty:
+   - cluster.kubeconfig
+   - cluster.namespace
+   - cluster.accelerator
+   - cluster.storage_class
+   - cluster.user
+   - model.hf_id
+   - model.image
+   - model.version
+   - model.storage_pvc
+   - benchmark.splits (must have at least one entry)
+   - benchmark.concurrency (must have at least one entry)
+   If any are empty, set valid=false and list missing fields in errors.
+
+3. Verify cluster access by running:
+   KUBECONFIG=<cluster.kubeconfig> oc whoami
+   If this fails, set valid=false and add the error.
+
+4. Check the namespace exists:
+   KUBECONFIG=<cluster.kubeconfig> oc get namespace <cluster.namespace>
+   If this fails, set valid=false and add the error.
+
+5. Check the storage class exists:
+   KUBECONFIG=<cluster.kubeconfig> oc get sc <cluster.storage_class>
+   If this fails, list available storage classes and set valid=false.
+
+6. Derive the deployment name from model.hf_id:
+   - Split on "/"
+   - Take the second part
+   - Lowercase
+   - Replace "." with "-"
+   Example: "openai/gpt-oss-120b" -> "gpt-oss-120b"
+
+6. Derive the endpoint URL:
+   http://<deployment_name>-predictor.<namespace>.svc.cluster.local:8080/v1
+
+7. Derive the pod name: guidellm-<cluster.user>
+
+Return the full parsed config, cluster_user from oc whoami, deployment_name, endpoint_url, pod_name, and any errors.
+`, { label: 'validate-config', schema: VALIDATE_SCHEMA })
+
+if (!validation || !validation.valid) {
+  const errs = validation ? validation.errors.join(', ') : 'validation agent failed'
+  log('VALIDATION FAILED: ' + errs)
+  return { success: false, error: errs }
+}
+
+const cfg = validation.config
+const deploymentName = validation.deployment_name
+const endpointUrl = validation.endpoint_url
+const podName = validation.pod_name
+const kc = `KUBECONFIG=${cfg.cluster.kubeconfig}`
+const ns = cfg.cluster.namespace
+
+log(`Validated: model=${cfg.model.hf_id}, deployment=${deploymentName}, pod=${podName}`)
+log(`Endpoint: ${endpointUrl}`)
+log(`Cluster user: ${validation.cluster_user}`)
+
+// Phase 2: Setup Infrastructure
+phase('Setup')
+log('Creating PVC and GuideLLM pod if they do not already exist...')
+
+const setup = await agent(`
+You are setting up benchmark infrastructure on a Kubernetes cluster.
+Do NOT assume anything exists — check first, then create only if missing.
+
+Use this prefix for ALL oc commands: ${kc}
+Namespace: ${ns}
+Pod name: ${podName}
+Storage class: ${cfg.cluster.storage_class}
+User: ${cfg.cluster.user}
+
+Steps:
+
+1. Check if PVC "client-storage" exists in namespace ${ns}:
+   ${kc} oc get pvc client-storage -n ${ns} --no-headers 2>/dev/null
+   - If it exists, log "PVC already exists, skipping creation"
+   - If it does NOT exist, create it:
+     ${kc} oc apply -f - <<EOF
+     apiVersion: v1
+     kind: PersistentVolumeClaim
+     metadata:
+       name: client-storage
+       namespace: ${ns}
+     spec:
+       accessModes: [ReadWriteOnce]
+       resources:
+         requests:
+           storage: 100Gi
+       storageClassName: ${cfg.cluster.storage_class}
+     EOF
+
+2. Check if pod "${podName}" exists in namespace ${ns}:
+   ${kc} oc get pod ${podName} -n ${ns} --no-headers 2>/dev/null
+   - If it exists and is Running, log "Pod already running, skipping creation"
+   - If it does NOT exist, create it:
+     ${kc} oc apply -f - <<EOF
+     apiVersion: v1
+     kind: Pod
+     metadata:
+       name: ${podName}
+       namespace: ${ns}
+       labels:
+         app: guidellm
+         user: ${cfg.cluster.user}
+     spec:
+       restartPolicy: Always
+       securityContext:
+         fsGroup: 0
+         runAsUser: 0
+       containers:
+       - name: guidellm
+         image: python:3.11-slim
+         imagePullPolicy: IfNotPresent
+         command: ["/bin/bash", "-c"]
+         args:
+         - |
+           set -e
+           apt-get update && apt-get install -y tmux vim git curl wget procps
+           pip install --upgrade pip
+           pip install 'guidellm[recommended] @ git+https://github.com/vllm-project/guidellm.git@${cfg.benchmark.guidellm_version}'
+           echo "Installation complete!"
+           tail -f /dev/null
+         workingDir: /data
+         resources:
+           requests: { cpu: "1", memory: "4Gi" }
+           limits: { cpu: "4", memory: "8Gi" }
+         securityContext:
+           runAsUser: 0
+         volumeMounts:
+         - { name: client-storage, mountPath: /data }
+       volumes:
+       - name: client-storage
+         persistentVolumeClaim:
+           claimName: client-storage
+     EOF
+
+3. Wait for pod to be Running and for GuideLLM installation to complete:
+   - Poll: ${kc} oc get pod ${podName} -n ${ns} -o jsonpath='{.status.phase}'
+   - Then check logs for "Installation complete!": ${kc} oc logs ${podName} -n ${ns} | tail -5
+   - Retry up to 30 times with 10s sleep (5 minutes total)
+   - If it never becomes ready, report failure.
+
+4. Verify guidellm is installed:
+   ${kc} oc exec -n ${ns} ${podName} -- guidellm --version
+
+5. Create results directory on pod:
+   ${kc} oc exec -n ${ns} ${podName} -- mkdir -p /data/results
+
+Report success=true if pod is running with guidellm installed, or success=false with details.
+`, { label: 'setup-infra', schema: STATUS_SCHEMA })
+
+if (!setup || !setup.success) {
+  log('SETUP FAILED: ' + (setup ? setup.message : 'agent failed'))
+  return { success: false, error: setup ? setup.message : 'setup agent failed' }
+}
+log('Infrastructure ready: ' + setup.message)
+
+// Phase 3: Deploy Model
+phase('Deploy')
+log('Deploying vLLM model via KServe...')
+
+// Build vllm args string
+const vllmArgsList = Object.entries(cfg.model.vllm_args || {}).map(([k, v]) => {
+  if (v === 'true') return `--${k}`
+  return `--${k} ${v}`
+})
+
+// Add speculative config if enabled
+let specConfigJson = ''
+if (cfg.spec_decoding && cfg.spec_decoding.enabled) {
+  const specObj = {
+    model: cfg.spec_decoding.draft_model,
+    num_speculative_tokens: cfg.spec_decoding.num_speculative_tokens,
+    method: cfg.spec_decoding.method,
+    draft_tensor_parallel_size: cfg.spec_decoding.draft_tensor_parallel_size,
+  }
+  specConfigJson = JSON.stringify(specObj)
+  vllmArgsList.push(`--speculative-config '${specConfigJson}'`)
+}
+
+const vllmArgsStr = vllmArgsList.join(' ')
+
+// Build runtime-args string for CSV (semicolon-separated)
+const runtimeArgsParts = Object.entries(cfg.model.vllm_args || {}).map(([k, v]) => `${k}: ${v}`)
+if (specConfigJson) {
+  runtimeArgsParts.push(`speculative-config:${specConfigJson}`)
+}
+const runtimeArgsStr = runtimeArgsParts.join('; ')
+
+const deploy = await agent(`
+You are deploying a vLLM model on Kubernetes via KServe (ServingRuntime + InferenceService).
+Do NOT assume the model is already deployed — check first.
+
+Use this prefix for ALL oc commands: ${kc}
+Namespace: ${ns}
+Deployment name: ${deploymentName}
+Model HF ID: ${cfg.model.hf_id}
+Image: ${cfg.model.image}
+TP: ${cfg.model.tp}
+GPU count: ${cfg.model.gpu_count}
+Storage PVC: ${cfg.model.storage_pvc}
+vLLM args: ${vllmArgsStr}
+
+Steps:
+
+1. Check if InferenceService "${deploymentName}" already exists:
+   ${kc} oc get inferenceservice ${deploymentName} -n ${ns} --no-headers 2>/dev/null
+   - If it exists and has Ready=True, log "Model already deployed and ready" and return success.
+   - If it exists but is not ready, wait for it (step 4).
+   - If it does NOT exist, proceed to step 2.
+
+2. Generate and apply the KServe manifest (ServingRuntime + InferenceService separated by ---).
+   The ServingRuntime should:
+   - Name: ${deploymentName}
+   - Container image: ${cfg.model.image}
+   - Command: python3 -m vllm.entrypoints.openai.api_server
+   - Args: ${vllmArgsStr} --model ${cfg.model.hf_id} --port 8080 --tensor-parallel-size ${cfg.model.tp}
+   - Port: 8080
+   - Include shared memory volume (emptyDir medium: Memory, sizeLimit: 16Gi) ONLY if tp > 1
+   - GPU resources: nvidia.com/gpu: ${cfg.model.gpu_count}
+
+   The InferenceService should:
+   - Name: ${deploymentName}
+   - storageUri: pvc://${cfg.model.storage_pvc}
+   - Annotation: storage.kserve.io/readonly: "false"
+   - Runtime: ${deploymentName}
+   - minReplicas: 1, maxReplicas: 1
+
+   Apply with: ${kc} oc apply -f -
+
+3. Wait for InferenceService to become Ready:
+   - Poll: ${kc} oc get inferenceservice ${deploymentName} -n ${ns} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+   - Should return "True"
+   - Retry up to 360 times with 10s sleep (1 hour total)
+   - If not ready after 1 hour, report failure with the current status.
+
+4. Verify the endpoint is reachable from the GuideLLM pod:
+   ${kc} oc exec -n ${ns} ${podName} -- curl -s -o /dev/null -w '%{http_code}' ${endpointUrl.replace('/v1', '/health')}
+   - Should return 200
+   - Retry up to 30 times with 10s sleep if not 200
+
+Report success=true when the model is deployed and health check passes, or success=false with details about what failed.
+`, { label: 'deploy-model', schema: STATUS_SCHEMA })
+
+if (!deploy || !deploy.success) {
+  log('DEPLOY FAILED: ' + (deploy ? deploy.message : 'agent failed'))
+  return { success: false, error: deploy ? deploy.message : 'deploy agent failed' }
+}
+log('Model deployed: ' + deploy.message)
+
+// Phase 4: Run Benchmarks
+phase('Benchmark')
+const splits = cfg.benchmark.splits || ['throughput_1k']
+const concurrencyList = (cfg.benchmark.concurrency || [1, 5, 25, 50, 100]).join(',')
+const benchmarkMode = cfg.benchmark.mode || 'multi-concurrency'
+
+log(`Running benchmarks: ${splits.length} split(s), concurrency=[${concurrencyList}], mode=${benchmarkMode}`)
+
+const benchResults = []
+for (const split of splits) {
+  log(`Starting benchmark for split: ${split}`)
+
+  let dataPath
+  if (cfg.benchmark.dataset === 'synthetic') {
+    dataPath = `prompt_tokens=1000,output_tokens=1000`
+  } else {
+    dataPath = `/data/datasets/speed-bench-processed/${split}/all.jsonl`
+  }
+
+  const outputPath = `/data/results/speedbench-${split}.json`
+  const dataFlag = cfg.benchmark.dataset === 'synthetic'
+    ? `--data "${dataPath}"`
+    : `--data ${dataPath}`
+
+  const bench = await agent(`
+You are running a GuideLLM benchmark on a Kubernetes cluster.
+This is a LONG-RUNNING operation — benchmarks can take 30-120 minutes per split.
+
+Use this prefix for ALL oc commands: ${kc}
+Namespace: ${ns}
+Pod: ${podName}
+Target endpoint: ${endpointUrl}
+Dataset: ${cfg.benchmark.dataset}
+Data path/config: ${dataPath}
+Output path on pod: ${outputPath}
+Concurrency levels: ${concurrencyList}
+Mode: ${benchmarkMode}
+
+Steps:
+
+1. If dataset is "speedbench", verify the dataset file exists on the pod:
+   ${kc} oc exec -n ${ns} ${podName} -- ls -la ${dataPath}
+   If it does NOT exist, report failure immediately — the user needs to upload datasets first.
+
+2. Create results directory on pod:
+   ${kc} oc exec -n ${ns} ${podName} -- mkdir -p /data/results
+
+3. Run the GuideLLM benchmark. Use mode "${benchmarkMode}":
+
+   For multi-concurrency mode (produces 1 JSON with all concurrency levels):
+   ${kc} oc exec -n ${ns} ${podName} -- guidellm benchmark \\
+     --target ${endpointUrl} \\
+     ${dataFlag} \\
+     --rate-type concurrent \\
+     --rate ${concurrencyList} \\
+     --output-path ${outputPath}
+
+   IMPORTANT: This command may take 30-120 minutes. Run it and wait for completion.
+   Do NOT set a short timeout — use at least 7200 seconds (2 hours).
+
+4. After completion, verify the output file exists:
+   ${kc} oc exec -n ${ns} ${podName} -- ls -la ${outputPath}
+
+Report success=true with the output path, or success=false with error details.
+Split name: ${split}
+`, { label: 'benchmark-' + split, schema: STATUS_SCHEMA })
+
+  benchResults.push({ split, result: bench })
+
+  if (!bench || !bench.success) {
+    log('BENCHMARK FAILED for ' + split + ': ' + (bench ? bench.message : 'agent failed'))
+  } else {
+    log('Benchmark complete for ' + split + ': ' + bench.message)
+  }
+}
+
+const failedBench = benchResults.filter(b => !b.result || !b.result.success)
+if (failedBench.length === benchResults.length) {
+  log('ALL BENCHMARKS FAILED')
+  return { success: false, error: 'all benchmarks failed' }
+}
+
+// Phase 5: Collect Results
+phase('Collect')
+log('Copying results from pod and verifying MD5 checksums...')
+
+const collect = await agent(`
+You are collecting benchmark results from a Kubernetes pod to the local machine.
+MD5 verification is MANDATORY — do not skip it.
+
+Use this prefix for ALL oc commands: ${kc}
+Namespace: ${ns}
+Pod: ${podName}
+Local results directory: ${cfg.output.results_dir}
+Splits that were benchmarked: ${splits.join(', ')}
+
+Steps:
+
+1. Create the local results directory: mkdir -p ${cfg.output.results_dir}
+
+2. For each split (${splits.join(', ')}):
+   a. Get the remote MD5 checksum:
+      ${kc} oc exec -n ${ns} ${podName} -- md5sum /data/results/speedbench-<split>.json
+
+   b. Copy the file:
+      ${kc} oc cp ${ns}/${podName}:/data/results/speedbench-<split>.json ${cfg.output.results_dir}/speedbench-<split>.json --retries=5
+
+   c. Get the local MD5 checksum:
+      md5 -r ${cfg.output.results_dir}/speedbench-<split>.json  (macOS)
+      OR: md5sum ${cfg.output.results_dir}/speedbench-<split>.json  (Linux)
+
+   d. Compare checksums. If they do NOT match:
+      - Delete the local file
+      - Retry the copy up to 3 times
+      - If still mismatched after 3 retries, report failure for that file
+
+3. List all collected files with their sizes.
+
+Report the list of files, their local paths, and whether MD5 matched for each.
+`, { label: 'collect-results', schema: COLLECT_SCHEMA })
+
+if (!collect || !collect.success) {
+  log('COLLECT FAILED: ' + (collect ? collect.message : 'agent failed'))
+  return { success: false, error: collect ? collect.message : 'collect agent failed' }
+}
+log('Results collected: ' + collect.message)
+
+// Phase 6: Convert to CSV
+phase('Convert')
+log('Converting JSON results to CSV...')
+
+const convert = await agent(`
+You are converting GuideLLM benchmark JSON files to CSV format using the import_manual_runs_json_v2.py script.
+
+The script is at: /Users/memehta/workspace/performance-dashboard/manual_runs/scripts/import_manual_runs_json_v2.py
+Activate virtualenv first: source ~/test_foo/python3_virt/bin/activate
+Run from: /Users/memehta/workspace/performance-dashboard/manual_runs/scripts
+
+Configuration:
+  Model: ${cfg.model.hf_id}
+  Version: ${cfg.model.version}
+  TP: ${cfg.model.tp}
+  Accelerator: ${cfg.cluster.accelerator}
+  Image tag: ${cfg.model.image}
+  GuideLLM version: ${cfg.benchmark.guidellm_version}
+  Spec decoding label: ${cfg.spec_decoding.label}
+  Prefix caching: ${cfg.benchmark.prefix_caching}
+  Runtime args: ${runtimeArgsStr}
+
+Results directory: ${cfg.output.results_dir}
+Splits: ${splits.join(', ')}
+
+Steps:
+
+For each split (${splits.join(', ')}):
+  1. Determine the dataset label from the split name:
+     - throughput_1k -> SPEEDBENCH-1k
+     - throughput_2k -> SPEEDBENCH-2k
+     - throughput_8k -> SPEEDBENCH-8k
+     - throughput_16k -> SPEEDBENCH-16k
+     - throughput_32k -> SPEEDBENCH-32k
+     - If synthetic, use "synthetic"
+
+  2. Determine the CSV filename:
+     ${cfg.output.results_dir}/speedbench-<split>_${cfg.spec_decoding.label}.csv
+
+  3. Run the import script:
+     source ~/test_foo/python3_virt/bin/activate
+     cd /Users/memehta/workspace/performance-dashboard/manual_runs/scripts
+     python import_manual_runs_json_v2.py \\
+       ${cfg.output.results_dir}/speedbench-<split>.json \\
+       --model "${cfg.model.hf_id}" \\
+       --version "${cfg.model.version}" \\
+       --tp ${cfg.model.tp} \\
+       --accelerator "${cfg.cluster.accelerator}" \\
+       --runtime-args '${runtimeArgsStr}' \\
+       --image-tag "${cfg.model.image}" \\
+       --guidellm-version "${cfg.benchmark.guidellm_version}" \\
+       --dataset "<DATASET_LABEL>" \\
+       --spec-decoding "${cfg.spec_decoding.label}" \\
+       --prefix-caching "${cfg.benchmark.prefix_caching}" \\
+       --csv-file "<CSV_PATH>"
+
+  4. Verify the CSV was created and has the expected number of rows.
+     Expected rows = number of concurrency levels (${(cfg.benchmark.concurrency || []).length}).
+
+  5. Copy the CSV to the results directory if it was created elsewhere.
+
+Report the list of CSV files created and their row counts.
+`, { label: 'convert-csv', schema: SUMMARY_SCHEMA })
+
+if (!convert) {
+  log('CONVERT FAILED: agent returned null')
+  return { success: false, error: 'convert agent failed' }
+}
+log('CSVs generated: ' + (convert.csv_files || []).join(', '))
+
+// Phase 7: Summary
+phase('Summary')
+log('Generating performance summary...')
+
+const summary = await agent(`
+You are generating a performance summary from benchmark CSV files.
+
+Results directory: ${cfg.output.results_dir}
+Model: ${cfg.model.hf_id}
+Spec decoding: ${cfg.spec_decoding.label} (enabled=${cfg.spec_decoding.enabled})
+Accelerator: ${cfg.cluster.accelerator}
+Splits: ${splits.join(', ')}
+
+Steps:
+
+1. Read all CSV files in ${cfg.output.results_dir} that end with .csv
+
+2. For each CSV, extract these key columns per concurrency level:
+   - intended concurrency
+   - output_tok/sec (throughput)
+   - tpot_median (time per output token, ms)
+   - itl_median (inter-token latency, ms)
+   - ttft_median (time to first token, ms)
+   - successful_requests
+   - errored_requests
+
+3. Print a formatted table showing these metrics per concurrency level, per split.
+
+4. Print the absolute values — do NOT compute comparison percentages (we only have one run config here).
+   Comparisons require a baseline run with a different config.
+
+5. Print a summary line with:
+   - Peak throughput (max output_tok/sec across all concurrency levels)
+   - Best TPOT (min tpot_median, usually at lowest concurrency)
+   - Total successful/errored requests
+
+Format the output as a clean markdown table that can be pasted into Jira or Slack.
+
+Return the formatted summary string and list of CSV files processed.
+`, { label: 'summary', schema: SUMMARY_SCHEMA })
+
+log('=== BENCHMARK COMPLETE ===')
+if (summary) {
+  log(summary.summary || 'Summary generated')
+}
+
+return {
+  success: true,
+  config: cfg,
+  deployment_name: deploymentName,
+  endpoint_url: endpointUrl,
+  csv_files: convert ? convert.csv_files : [],
+  summary: summary ? summary.summary : '',
+}

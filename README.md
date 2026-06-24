@@ -10,10 +10,23 @@ End-to-end recipe for benchmarking vLLM inference with speculative decoding (Eag
 4. **Results collection** - Copying JSON results from pods with checksum verification
 5. **CSV conversion** - Converting GuideLLM JSON to performance dashboard CSV format
 
+## Quick Start (Automated via Claude Workflow)
+
+```bash
+git clone https://github.com/MML-coder/spec-decode-perf-benchmark-recipe.git
+cd spec-decode-perf-benchmark-recipe
+cp config-examples/gpt-oss-120b-nvidia-eagle3.yaml config.yaml
+# Edit config.yaml with your cluster details
+claude /workflows spec-decode-benchmark
+```
+
+See [Section 8 of CLAUDE.md](CLAUDE.md#8-running-via-claude-workflow-automated) for full workflow details.
+
 ## Quick Links
 
 - [Full Recipe (CLAUDE.md)](CLAUDE.md) - Step-by-step guide with command templates
 - [SPEED-Bench Dataset Reference](datasets/speedbench.md) - Dataset splits, sample counts, preprocessing
+- [Example Configs](config-examples/) - Pre-filled configs for common model/draft combinations
 
 ## Related Tools
 

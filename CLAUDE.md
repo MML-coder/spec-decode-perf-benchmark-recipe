@@ -604,7 +604,94 @@ done
 
 ---
 
-## 8. Tool References
+## 8. Running via Claude Workflow (Automated)
+
+Instead of running each step manually, you can use the Claude Code workflow to automate the entire process.
+
+### Prerequisites
+
+- [Claude Code](https://claude.com/claude-code) installed
+- `oc` CLI installed and in PATH
+- A valid kubeconfig for the target cluster
+- The [openshift-psap/performance-dashboard](https://github.com/openshift-psap/performance-dashboard) repo cloned at `/Users/memehta/workspace/performance-dashboard/`
+- Python virtualenv with pandas at `~/test_foo/python3_virt/`
+
+### Setup
+
+```bash
+# Clone this repo
+git clone https://github.com/MML-coder/spec-decode-perf-benchmark-recipe.git
+cd spec-decode-perf-benchmark-recipe
+
+# Copy an example config and edit it for your cluster
+cp config-examples/gpt-oss-120b-nvidia-eagle3.yaml config.yaml
+
+# Edit config.yaml:
+#   - cluster.kubeconfig: path to your kubeconfig
+#   - cluster.namespace: target namespace
+#   - cluster.storage_class: run "oc get sc" to find available classes
+#   - cluster.user: your username
+#   - model.*: model details
+#   - spec_decoding.*: draft model config (or enabled: false for baseline)
+```
+
+### Run the Workflow
+
+```bash
+claude /workflows spec-decode-benchmark
+```
+
+### What the Workflow Does
+
+The workflow runs 7 phases sequentially:
+
+1. **Validate** — Reads `config.yaml`, verifies kubeconfig works (`oc whoami`), checks namespace and storage class exist
+2. **Setup** — Creates `client-storage` PVC and GuideLLM pod if they don't already exist. Waits for pod readiness and GuideLLM installation (~2 min)
+3. **Deploy** — Generates KServe manifests (ServingRuntime + InferenceService), applies them, waits for model to be ready (5-30 min depending on model size)
+4. **Benchmark** — Runs GuideLLM for each dataset split at configured concurrency levels. This is the longest phase (30-120 min per split)
+5. **Collect** — Copies JSON results from pod to local machine with MD5 checksum verification
+6. **Convert** — Runs `import_manual_runs_json_v2.py` to convert each JSON to a 48-column CSV
+7. **Summary** — Prints a performance summary table with throughput, TPOT, ITL, TTFT per concurrency level
+
+### Example Configs
+
+| Config | Model | Spec Decoding |
+|--------|-------|---------------|
+| `gpt-oss-120b-nvidia-eagle3.yaml` | openai/gpt-oss-120b | Nvidia Eagle3 |
+| `gpt-oss-120b-redhat-eagle3.yaml` | openai/gpt-oss-120b | RedHat Eagle3 |
+| `gpt-oss-120b-baseline.yaml` | openai/gpt-oss-120b | None (baseline) |
+| `gemma-31b-redhat-eagle3.yaml` | google/gemma-4-31B-it | RedHat Eagle3 |
+
+### Storage Class Note
+
+The storage class varies by cluster. Check yours with `oc get sc` before running:
+
+| Cluster | Recommended Storage Class |
+|---------|--------------------------|
+| rhaiis-h200 | `lvms-vg1` |
+| rhaiis-ibm-dc | `nfs-provisioner` |
+| psap-b200-mlperf | `lvms-vg1` |
+
+### Timing
+
+| Phase | Duration |
+|-------|----------|
+| Validate + Setup | ~5 minutes |
+| Deploy Model | 5-30 minutes |
+| Benchmark (per split) | 30-120 minutes |
+| Collect + Convert + Summary | ~5 minutes |
+| **Total** | **45 min to 3+ hours** |
+
+### Important Rules
+
+- **Do not assume** — the workflow checks everything before acting (cluster access, namespace, storage class, existing resources)
+- **Idempotent** — running the workflow twice won't create duplicate resources. It checks if PVC/pod/model already exist
+- **MD5 mandatory** — every file copy is verified by checksum. Mismatched files are re-copied automatically
+- **No hallucinated data** — the summary only reports metrics from actual benchmark results, never fabricated numbers
+
+---
+
+## 9. Tool References
 
 | Tool | Location | Purpose |
 |------|----------|---------|

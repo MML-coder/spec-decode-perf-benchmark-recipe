@@ -1,0 +1,39 @@
+# gpt-oss-120b baseline (no speculative decoding) on RHAIIS
+cluster:
+  kubeconfig: /Users/memehta/kubeconfigs/kubeconfig-rhaiis-h200
+  namespace: kserve-e2e-perf
+  accelerator: H200
+  storage_class: lvms-vg1
+  user: mehulm
+
+model:
+  hf_id: openai/gpt-oss-120b
+  image: quay.io/aipcc/rhaiis/cuda-ubi9:3.5.0-ea.1-1779124632
+  version: RHAIIS-3.5.EA1
+  tp: 1
+  gpu_count: 1
+  storage_pvc: model-pvc
+  vllm_args:
+    gpu-memory-utilization: "0.85"
+    trust-remote-code: "true"
+    disable-log-requests: "true"
+    uvicorn-log-level: debug
+    no-enable-prefix-caching: "true"
+    enable-expert-parallel: "true"
+
+spec_decoding:
+  enabled: false
+  label: none
+
+benchmark:
+  dataset: speedbench
+  splits:
+    - throughput_1k
+    - throughput_8k
+  concurrency: [1, 5, 25, 50, 100]
+  mode: multi-concurrency
+  guidellm_version: v0.6.0
+  prefix_caching: "yes"
+
+output:
+  results_dir: ./results

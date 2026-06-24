@@ -1,0 +1,49 @@
+# Speculative Decoding Benchmark Configuration
+# Copy this file, fill in your cluster details, and run:
+#   KUBECONFIG=/path/to/kubeconfig claude /workflows spec-decode-benchmark
+
+cluster:
+  kubeconfig: ""                       # path to kubeconfig file
+  namespace: kserve-e2e-perf           # namespace for benchmark pods
+  accelerator: H200                    # H200, B200, MI300X
+  storage_class: lvms-vg1              # cluster storage class (run: oc get sc)
+  user: ""                             # your username (for pod naming)
+
+model:
+  hf_id: ""                           # HuggingFace model ID (e.g., openai/gpt-oss-120b)
+  image: ""                           # vLLM container image
+  version: ""                         # version label for CSV (e.g., RHAIIS-3.5.EA1, vLLM-0.22.0)
+  tp: 1                               # tensor parallelism size
+  gpu_count: 1                        # number of GPUs (usually = tp)
+  storage_pvc: model-pvc              # PVC containing model weights
+  vllm_args:
+    gpu-memory-utilization: "0.85"
+    trust-remote-code: "true"
+    disable-log-requests: "true"
+    uvicorn-log-level: debug
+    no-enable-prefix-caching: "true"
+
+spec_decoding:
+  enabled: false                       # set true to enable speculative decoding
+  draft_model: ""                      # draft model HF ID
+  num_speculative_tokens: 3
+  method: eagle3
+  draft_tensor_parallel_size: 1
+  label: baseline                      # label for CSV spec_decoding column
+
+benchmark:
+  dataset: speedbench                  # speedbench or synthetic
+  splits:                              # which SPEEDBENCH splits to run
+    - throughput_1k
+  concurrency:                         # concurrency levels to sweep
+    - 1
+    - 5
+    - 25
+    - 50
+    - 100
+  mode: multi-concurrency             # multi-concurrency (1 JSON) or per-concurrency (N JSONs)
+  guidellm_version: v0.6.0
+  prefix_caching: "yes"
+
+output:
+  results_dir: ./results               # local directory for JSON + CSV output

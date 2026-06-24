@@ -1,0 +1,43 @@
+# gemma-4-31B-it with RedHat Eagle3 draft model on upstream vLLM
+cluster:
+  kubeconfig: /Users/memehta/kubeconfigs/kubeconfig-rhaiis-h200
+  namespace: kserve-e2e-perf
+  accelerator: H200
+  storage_class: lvms-vg1
+  user: mehulm
+
+model:
+  hf_id: google/gemma-4-31B-it
+  image: vllm/vllm-openai:v0.22.0
+  version: vLLM-0.22.0
+  tp: 1
+  gpu_count: 1
+  storage_pvc: model-pvc
+  vllm_args:
+    gpu-memory-utilization: "0.85"
+    trust-remote-code: "true"
+    disable-log-requests: "true"
+    uvicorn-log-level: debug
+    no-enable-prefix-caching: "true"
+    enable-expert-parallel: "true"
+
+spec_decoding:
+  enabled: true
+  draft_model: RedHatAI/gemma-4-31B-it-speculator.eagle3
+  num_speculative_tokens: 3
+  method: eagle3
+  draft_tensor_parallel_size: 1
+  label: eagle3-redhat
+
+benchmark:
+  dataset: speedbench
+  splits:
+    - throughput_1k
+    - throughput_8k
+  concurrency: [1, 5, 25, 50, 100]
+  mode: multi-concurrency
+  guidellm_version: v0.6.0
+  prefix_caching: "yes"
+
+output:
+  results_dir: ./results
