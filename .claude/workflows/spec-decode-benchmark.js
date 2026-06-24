@@ -143,17 +143,25 @@ You are validating the benchmark configuration. Do these steps exactly:
    KUBECONFIG=<cluster.kubeconfig> oc get sc <cluster.storage_class>
    If this fails, list available storage classes and set valid=false.
 
-6. Derive the deployment name from model.hf_id:
+6. If model.node_selector is empty, auto-detect the GPU node:
+   KUBECONFIG=<cluster.kubeconfig> oc get nodes -l nvidia.com/gpu.present=true -o jsonpath='{.items[0].metadata.name}'
+   If that returns nothing, try:
+   KUBECONFIG=<cluster.kubeconfig> oc get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.capacity.nvidia\.com/gpu}{"\n"}{end}' | grep -v '<none>' | grep -v '^$'
+   Pick the first node that has nvidia.com/gpu > 0.
+   If no GPU node found, set valid=false with error "No GPU nodes found on cluster".
+   Set the discovered node name as node_selector in the returned config.
+
+7. Derive the deployment name from model.hf_id:
    - Split on "/"
    - Take the second part
    - Lowercase
    - Replace "." with "-"
    Example: "openai/gpt-oss-120b" -> "gpt-oss-120b"
 
-6. Derive the endpoint URL:
+8. Derive the endpoint URL:
    http://<deployment_name>-predictor.<namespace>.svc.cluster.local:8080/v1
 
-7. Derive the pod name: guidellm-<cluster.user>
+9. Derive the pod name: guidellm-<cluster.user>
 
 Return the full parsed config, cluster_user from oc whoami, deployment_name, endpoint_url, pod_name, and any errors.
 `, { label: 'validate-config', schema: VALIDATE_SCHEMA })
@@ -279,10 +287,10 @@ log('Infrastructure ready: ' + setup.message)
 phase('Deploy')
 log('Deploying vLLM model via KServe...')
 
-// Build vllm args string
-const vllmArgsList = Object.entries(cfg.model.vllm_args || {}).map(([k, v]) => {
-  if (v === 'true') return `--${k}`
-  return `--${k} ${v}`
+// Build vllm args as YAML list items for the template
+const vllmArgItems = Object.entries(cfg.model.vllm_args || {}).map(([k, v]) => {
+  if (v === 'true') return `    - --${k}`
+  return `    - --${k}=${v}`
 })
 
 // Add speculative config if enabled
@@ -295,10 +303,10 @@ if (cfg.spec_decoding && cfg.spec_decoding.enabled) {
     draft_tensor_parallel_size: cfg.spec_decoding.draft_tensor_parallel_size,
   }
   specConfigJson = JSON.stringify(specObj)
-  vllmArgsList.push(`--speculative-config '${specConfigJson}'`)
+  vllmArgItems.push(`    - '--speculative-config=${specConfigJson}'`)
 }
 
-const vllmArgsStr = vllmArgsList.join(' ')
+const vllmArgsYaml = vllmArgItems.join('\n')
 
 // Build runtime-args string for CSV (semicolon-separated)
 const runtimeArgsParts = Object.entries(cfg.model.vllm_args || {}).map(([k, v]) => `${k}: ${v}`)
@@ -307,52 +315,56 @@ if (specConfigJson) {
 }
 const runtimeArgsStr = runtimeArgsParts.join('; ')
 
+// Generate a deployment UUID
+const deployUuid = [deploymentName, 'bench'].join('-').substring(0, 36)
+
 const deploy = await agent(`
-You are deploying a vLLM model on Kubernetes via KServe (ServingRuntime + InferenceService).
+You are deploying a vLLM model on Kubernetes via KServe using the template at manifests/kserve-template.yaml.
 Do NOT assume the model is already deployed — check first.
+Do NOT generate YAML from scratch — use the template and replace placeholders.
 
 Use this prefix for ALL oc commands: ${kc}
 Namespace: ${ns}
 Deployment name: ${deploymentName}
-Model HF ID: ${cfg.model.hf_id}
-Image: ${cfg.model.image}
-TP: ${cfg.model.tp}
-GPU count: ${cfg.model.gpu_count}
-Storage PVC: ${cfg.model.storage_pvc}
-vLLM args: ${vllmArgsStr}
 
 Steps:
 
 1. Check if InferenceService "${deploymentName}" already exists:
    ${kc} oc get inferenceservice ${deploymentName} -n ${ns} --no-headers 2>/dev/null
    - If it exists and has Ready=True, log "Model already deployed and ready" and return success.
-   - If it exists but is not ready, wait for it (step 4).
+   - If it exists but is not ready, wait for it (step 3).
    - If it does NOT exist, proceed to step 2.
 
-2. Generate and apply the KServe manifest (ServingRuntime + InferenceService separated by ---).
-   The ServingRuntime should:
-   - Name: ${deploymentName}
-   - Container image: ${cfg.model.image}
-   - Command: python3 -m vllm.entrypoints.openai.api_server
-   - Args: ${vllmArgsStr} --model ${cfg.model.hf_id} --port 8080 --tensor-parallel-size ${cfg.model.tp}
-   - Port: 8080
-   - Include shared memory volume (emptyDir medium: Memory, sizeLimit: 16Gi) ONLY if tp > 1
-   - GPU resources: nvidia.com/gpu: ${cfg.model.gpu_count}
+2. Read the template file manifests/kserve-template.yaml and replace these placeholders:
+   __NAME__                  -> ${deploymentName}
+   __NAMESPACE__             -> ${ns}
+   __MODEL_ID__              -> ${cfg.model.hf_id}
+   __IMAGE__                 -> ${cfg.model.image}
+   __VLLM_ARGS__             -> (see below)
+   __GPU_COUNT__             -> ${cfg.model.gpu_count}
+   __NODE_SELECTOR__         -> ${cfg.model.node_selector}
+   __STORAGE_PVC__           -> ${cfg.model.storage_pvc}
+   __SERVICE_ACCOUNT__       -> ${cfg.model.service_account || 'sa'}
+   __IMAGE_PULL_SECRET__     -> ${cfg.model.image_pull_secret || 'default-dockercfg'}
+   __HF_TOKEN_SECRET__       -> ${cfg.model.hf_token_secret || 'storage-config'}
+   __SHARED_MEMORY_SIZE__    -> ${cfg.model.shared_memory_size || '8Gi'}
+   __MODEL_LOADING_TIMEOUT__ -> ${cfg.model.model_loading_timeout || 300000}
+   __DEPLOYMENT_UUID__       -> ${deployUuid}
 
-   The InferenceService should:
-   - Name: ${deploymentName}
-   - storageUri: pvc://${cfg.model.storage_pvc}
-   - Annotation: storage.kserve.io/readonly: "false"
-   - Runtime: ${deploymentName}
-   - minReplicas: 1, maxReplicas: 1
+   For __VLLM_ARGS__, replace the placeholder line with these YAML list items:
+${vllmArgsYaml}
 
-   Apply with: ${kc} oc apply -f -
+   If node_selector is empty (""), REMOVE the entire nodeSelector block (both the key and value lines).
+   If image_pull_secret is empty (""), REMOVE the imagePullSecrets block.
+
+   Write the rendered manifest to a temp file, then apply:
+   ${kc} oc apply -f /tmp/kserve-${deploymentName}.yaml
 
 3. Wait for InferenceService to become Ready:
    - Poll: ${kc} oc get inferenceservice ${deploymentName} -n ${ns} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
    - Should return "True"
    - Retry up to 360 times with 10s sleep (1 hour total)
-   - If not ready after 1 hour, report failure with the current status.
+   - If not ready after 1 hour, report failure with the current status and pod events.
 
 4. Verify the endpoint is reachable from the GuideLLM pod:
    ${kc} oc exec -n ${ns} ${podName} -- curl -s -o /dev/null -w '%{http_code}' ${endpointUrl.replace('/v1', '/health')}

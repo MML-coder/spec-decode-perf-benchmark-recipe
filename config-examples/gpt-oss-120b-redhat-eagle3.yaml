@@ -13,6 +13,12 @@ model:
   tp: 1
   gpu_count: 1
   storage_pvc: model-pvc
+  node_selector: ""
+  service_account: sa
+  image_pull_secret: npalaska-image-pull
+  hf_token_secret: storage-config
+  shared_memory_size: 8Gi
+  model_loading_timeout: 300000
   vllm_args:
     gpu-memory-utilization: "0.85"
     trust-remote-code: "true"

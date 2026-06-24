@@ -16,6 +16,12 @@ model:
   tp: 1                               # tensor parallelism size
   gpu_count: 1                        # number of GPUs (usually = tp)
   storage_pvc: model-pvc              # PVC containing model weights
+  node_selector: ""                   # kubernetes.io/hostname value (run: oc get nodes)
+  service_account: sa                 # service account for model pod
+  image_pull_secret: ""               # image pull secret name (if needed for private registry)
+  hf_token_secret: storage-config     # K8s secret name containing HF_TOKEN key
+  shared_memory_size: 8Gi             # /dev/shm size (use 64Gi for large TP)
+  model_loading_timeout: 300000       # builtInAdapter timeout in ms
   vllm_args:
     gpu-memory-utilization: "0.85"
     trust-remote-code: "true"
